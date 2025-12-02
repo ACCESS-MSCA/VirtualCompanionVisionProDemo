@@ -1,0 +1,53 @@
+# Xcode
+.DS_Store
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.xccheckout
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# Build
+build/
+DerivedData/
+*.o
+*.swp
+*.tmp
+
+# Swift Package Manager
+/.build/
+/Packages/
+/Package.resolved
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# Carthage
+Carthage/Build/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# visionOS / RealityKit / AR assets
+*.reality
+*.rcproject
+*.rcproject_backup
+*.arresourcegroup
+*.arresourcegroupbackup
+
+# Archives
+*.xcarchive
+
+# Logs & Misc
+*.log
+*.DS_Store
+*.orig
+*.zip
