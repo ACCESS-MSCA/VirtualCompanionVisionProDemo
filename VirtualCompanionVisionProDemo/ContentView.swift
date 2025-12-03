@@ -7,6 +7,9 @@
 
 import SwiftUI
 import AVFoundation
+#if os(visionOS)
+import AVFAudio
+#endif
 import Speech   // STT (Speech-to-Text)
 import PhotosUI   // for picking a screenshot from Photos
 import ImageIO      // for downscaling/compressing screenshots before upload
@@ -219,6 +222,18 @@ final class SpeechManager: ObservableObject {
     }
 }
 
+#if os(visionOS)
+fileprivate func mcRequestMicPermission(_ handler: @escaping (Bool) -> Void) {
+    // visionOS: use AVAudioApplication instead of AVAudioSession
+    AVAudioApplication.requestRecordPermission(completionHandler: handler)
+}
+#else
+fileprivate func mcRequestMicPermission(_ handler: @escaping (Bool) -> Void) {
+    // iOS/macOS/etc: keep using AVAudioSession
+    AVAudioSession.sharedInstance().requestRecordPermission(handler)
+}
+#endif
+
 // MARK: - STT (Speech to Text)
 /// Handles microphone capture + on-device Speech framework recognition.
 /// Produces partial transcripts, stops automatically after brief silence, and emits a final text callback.
@@ -251,13 +266,17 @@ final class SpeechToTextManager: NSObject, ObservableObject {
     }
 
     /// Ask for both speech recognition and microphone permissions.
+    /// Ask for both speech recognition and microphone permissions.
     func ensureAuthorization(_ completion: @escaping (Bool) -> Void) {
         SFSpeechRecognizer.requestAuthorization { status in
             let speechOK = (status == .authorized)
-            AVAudioSession.sharedInstance().requestRecordPermission { micOK in
+
+            mcRequestMicPermission { micOK in
                 DispatchQueue.main.async {
                     if !(speechOK && micOK) {
-                        let msg = !speechOK ? "Speech recognition permission denied." : "Microphone permission denied."
+                        let msg = !speechOK
+                            ? "Speech recognition permission denied."
+                            : "Microphone permission denied."
                         self.onError?(msg)
                     }
                     completion(speechOK && micOK)
