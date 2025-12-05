@@ -511,163 +511,7 @@ fileprivate func shouldFriendlyRewrite(_ text: String) -> Bool {
 // C# delegate type: void SwiftCallback(const char* message)
 typealias UnityCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
 
-// MARK: - FastVLM Engine (on-device vision encoder + MLX LLM)
-struct FastVLMEngine {
-    struct Assets {
-        let visionURL: URL?
-        let llmDirURL: URL?
-    }
 
-    static func locateAssets() -> Assets {
-        let b = Bundle.main
-
-        // ---- Find the vision model: prefer compiled .mlmodelc, fallback to .mlpackage ----
-        var vision: URL? = nil
-        // Compiled CoreML bundle
-        if let allC = b.urls(forResourcesWithExtension: "mlmodelc", subdirectory: nil) {
-            vision = allC.first(where: { $0.lastPathComponent.lowercased().contains("fastvithd") })
-        }
-        // Raw package
-        if vision == nil, let allP = b.urls(forResourcesWithExtension: "mlpackage", subdirectory: nil) {
-            vision = allP.first(where: { $0.lastPathComponent.lowercased().contains("fastvithd") })
-        }
-        // Fallback: look by expected subdirectories if present
-        if vision == nil {
-            vision = b.url(forResource: "fastvithd", withExtension: "mlmodelc",
-                           subdirectory: "Resources/Models/FastVLM/vision/FastViTHD-0_5b")
-                  ?? b.url(forResource: "fastvithd", withExtension: "mlpackage",
-                           subdirectory: "Resources/Models/FastVLM/vision/FastViTHD-0_5b")
-                  ?? b.url(forResource: "fastvithd", withExtension: "mlmodelc",
-                           subdirectory: "Models/FastVLM/vision/FastViTHD-0_5b")
-                  ?? b.url(forResource: "fastvithd", withExtension: "mlpackage",
-                           subdirectory: "Models/FastVLM/vision/FastViTHD-0_5b")
-                  ?? b.url(forResource: "fastvithd", withExtension: "mlmodelc",
-                           subdirectory: "Resources/Models/FastVLM/vision")
-                  ?? b.url(forResource: "fastvithd", withExtension: "mlpackage",
-                           subdirectory: "Resources/Models/FastVLM/vision")
-                  ?? b.url(forResource: "FastViTHD-0_5b", withExtension: "mlmodelc",
-                           subdirectory: "Resources/Models/FastVLM/vision")
-                  ?? b.url(forResource: "FastViTHD-0_5b", withExtension: "mlpackage",
-                           subdirectory: "Resources/Models/FastVLM/vision")
-        }
-
-        // ---- Find the LLM folder (look for tokenizer + safetensors) ----
-        var llmDir: URL? = nil
-        let candidateDirs: [String] = [
-            "Resources/Models/FastVLM/llm/FastVLM-0_5b-mlx",
-            "Models/FastVLM/llm/FastVLM-0_5b-mlx",
-            "FastVLM/llm/FastVLM-0_5b-mlx",
-            "Models/FastVLM-0_5b-mlx",
-            "FastVLM-0_5b-mlx"
-        ]
-        for sub in candidateDirs {
-            if let u = b.url(forResource: "tokenizer", withExtension: "json", subdirectory: sub)?.deletingLastPathComponent() { llmDir = u; break }
-            if let u = b.url(forResource: "vocab", withExtension: "json", subdirectory: sub)?.deletingLastPathComponent() { llmDir = u; break }
-        }
-        if llmDir == nil, let root = b.resourceURL {
-            if let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
-                for case let url as URL in e where url.hasDirectoryPath {
-                    let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
-                    let hasTok = names.contains(where: { $0.contains("tokenizer.json") || $0.contains("vocab.json") })
-                    let hasWts = names.contains(where: { $0.hasSuffix(".safetensors") })
-                    if hasTok && hasWts { llmDir = url; break }
-                }
-            }
-        }
-
-        // Always log what we found (helps diagnose bundle resource issues)
-        print("FastVLM locator → bundle:", b.bundlePath)
-        print("FastVLM locator → vision:", vision?.path ?? "nil")
-        print("FastVLM locator → llmDir:", llmDir?.path ?? "nil")
-
-        return Assets(visionURL: vision, llmDirURL: llmDir)
-    }
-
-    static func debugLogBundleTree() {
-        guard let root = Bundle.main.resourceURL else { return }
-        print("— FastVLM bundle tree (filtered) —")
-        if let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
-            for case let url as URL in e {
-                let p = url.path.lowercased()
-                if p.hasSuffix(".mlpackage") || p.hasSuffix(".mlmodelc") || p.hasSuffix(".safetensors") || p.contains("fastvlm") || p.contains("fastvithd") {
-                    print(" •", url.path)
-                }
-            }
-        }
-    }
-    
-    static func loadVisionModel(at url: URL) throws -> MLModel {
-        #if targetEnvironment(simulator)
-        throw NSError(
-            domain: "FastVLM",
-            code: 9001,
-            userInfo: [NSLocalizedDescriptionKey:
-                "FastVLM vision model requires MPSGraph and cannot run in the Simulator. " +
-                "Please test on device or a macOS target. Falling back to hosted vision."]
-        )
-        #else
-        let cfg = MLModelConfiguration()
-        cfg.computeUnits = .cpuAndGPU  // okay to use .all on device if you prefer
-        cfg.allowLowPrecisionAccumulationOnGPU = true
-        return try MLModel(contentsOf: url, configuration: cfg)
-        #endif
-    }
-
-        static func readinessIssue(_ a: Assets) -> String? {
-            guard a.visionURL != nil else { return "Missing fastvithd.mlpackage in the app bundle (e.g., Resources/Models/FastVLM/vision/…)." }
-            guard let llm = a.llmDirURL else { return "Missing FastVLM-0_5b-mlx folder (tokenizer + *.safetensors) in the app bundle." }
-            let items = (try? FileManager.default.contentsOfDirectory(atPath: llm.path)) ?? []
-            let hasTokenizer = items.contains(where: { $0.contains("tokenizer.json") || $0.contains("vocab.json") })
-            let hasWeights   = items.contains(where: { $0.hasSuffix(".safetensors") })
-            if !hasTokenizer { return "LLM folder present but tokenizer files are missing (tokenizer.json or vocab.json)." }
-            if !hasWeights   { return "LLM folder present but no *.safetensors weights found." }
-            return nil
-        }
-
-
-
-
-    #if canImport(MLX)
-    // Minimal placeholder decoder. Replace with real MLXLLM loading/generation.
-    final class Decoder {
-        let baseURL: URL
-        init(baseURL: URL) { self.baseURL = baseURL }
-        func generateAnswer(from visualBrief: String, userPrompt: String, maxTokens: Int = 192) async throws -> String {
-            // TODO: Implement MLXLLM vision-conditioned decoding here.
-            return "Visual brief: \(visualBrief.prefix(160))"
-        }
-    }
-    static func loadDecoder(at folder: URL) async throws -> Decoder {
-        Decoder(baseURL: folder) // TODO: swap for actual MLXLLM loader
-    }
-    #endif
-
-    /// Encode image (CoreML), then decode with MLX LLM (or error if MLX missing).
-    static func runBrief(imageData: Data, mime: String, userPrompt: String) async throws -> String {
-        let assets = locateAssets()
-        if let issue = readinessIssue(assets) {
-            throw NSError(domain: "FastVLM", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
-        }
-        guard let vURL = assets.visionURL, let lURL = assets.llmDirURL else {
-            throw NSError(domain: "FastVLM", code: 3, userInfo: [NSLocalizedDescriptionKey: "FastVLM assets not found in bundle."])
-        }
-
-        // Load vision tower
-        _ = try loadVisionModel(at: vURL)
-
-        // Placeholder brief (replace when wiring features → decoder)
-        let approxKB = max(1, imageData.count / 1024)
-        let brief = "Image \(mime), ~\(approxKB)KB; encoded by FastViTHD. (Prototype brief)"
-
-        #if canImport(MLX)
-        let decoder = try await loadDecoder(at: lURL)
-        return try await decoder.generateAnswer(from: brief, userPrompt: userPrompt)
-        #else
-        throw NSError(domain: "FastVLM", code: 4,
-                      userInfo: [NSLocalizedDescriptionKey: "MLX not linked to target. Add MLX Swift package to enable FastVLM."])
-        #endif
-    }
-}
 
 final class MovioUnityBridge: NSObject {
     static let shared = MovioUnityBridge()
@@ -927,18 +771,13 @@ struct ContentView: View {
     private var canSend: Bool {
         if isSending || stt.isListening { return false }
         if hasImageInput {
-            if useFastVLM {
-                // FastVLM path: needs NVIDIA key (for GPT-OSS composition). Prompt may be empty.
-                return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            } else {
-                // Qwen-VL hosted path
-                // Hosted path: require token by provider (HF vs ModelScope). ModelScope token is stored privately.
-                let needsModelScope = hfModel.lowercased().hasSuffix(":modelscope")
-                let tokenOK = needsModelScope
-                    ? !modelScopeToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    : !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                return tokenOK && !hfModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
+            // Qwen-VL hosted path only
+            // Hosted path: require token by provider (HF vs ModelScope). ModelScope token is stored privately.
+            let needsModelScope = hfModel.lowercased().hasSuffix(":modelscope")
+            let tokenOK = needsModelScope
+                ? !modelScopeToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                : !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return tokenOK && !hfModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         } else {
             // GPT-OSS text route
             return !apiKey.isEmpty &&
@@ -946,9 +785,7 @@ struct ContentView: View {
         }
     }
     
-    // Vision backend: FastVLM on-device (preferred) vs Qwen-VL (hosted)
-    @State private var useFastVLM: Bool = true
-    @State private var apiKey: String = "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"          // Paste your key for now (we’ll move to Keychain next step)
+    @State private var apiKey: String = "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"          // Paste your key for now (we’ll move to Keychain next step)
     @State private var tavilyKey: String = "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"
     @State private var userInput: String = ""
     @State private var messages: [ChatMessage] = [
@@ -995,7 +832,6 @@ struct ContentView: View {
     private let modelScopeToken: String = "ms-ad35a3c3-03db-4ad2-a9ab-cdae539799b4"
     @State private var selectedItem: PhotosPickerItem? = nil
     @State private var selectedImageData: Data? = nil
-    @State private var benchmarkPrompt: String = "Briefly describe this UI screenshot and list two key elements."
     @State private var imageURLText: String = ""
     // Shows which engine handled the last turn
     @State private var activeEngine: String? = nil   // "GPT-OSS" or "QWEN Vision Agent"
@@ -1130,27 +966,8 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - FastVLM route (on-device; falls back to Qwen with actionable errors)
+    // MARK: - Direct answer helpers (GPT‑OSS text path)
     @MainActor
-    private func runFastVLM(imageData: Data, mime: String, userText: String) async {
-        do {
-            // 1) On-device brief
-            let brief = try await FastVLMEngine.runBrief(imageData: imageData, mime: mime, userPrompt: userText)
-
-            // 2) Compose final prose via your text agent (keeps tone + optional search patterns)
-            let msgs = buildDirectAnswerMessages(latestUser: userText + "\n\nVisual brief:\n" + brief)
-            let res = try await client.send(messages: msgs, apiKey: apiKey)
-            var text = cleanModelText(res.choices.first?.message?.content ?? "")
-            text = try await continueIfIncomplete(text, context: msgs, apiKey: apiKey)
-            text = await applyMovioTone(text, mood: selectedMood)
-            showAndSpeak(text)
-        } catch {
-            let reason = (error as NSError).localizedDescription
-            self.errorText = "FastVLM: \(reason)"
-            messages.append(.init(role: "assistant", content: "FastVLM error — \(reason). Falling back to hosted vision…"))
-            await runQwenAgent(imageData: imageData, mime: mime, userText: userText)
-        }
-    }
 
     // Build a minimal, planning‑free context to coax a direct natural‑language answer
     private func buildDirectAnswerMessages(latestUser: String) -> [ChatMessage] {
@@ -1256,17 +1073,7 @@ struct ContentView: View {
                 Spacer()
             }
             
-            HStack(spacing: 8) {
-                Text("Vision backend:")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Toggle(isOn: $useFastVLM) {
-                    Text(useFastVLM ? "FastVLM (on-device)" : "Qwen-VL (hosted)")
-                        .font(.caption)
-                }
-                .toggleStyle(.switch)
-                Spacer()
-            }
+
             
             // API key input (temporary; we’ll store in Keychain next)
             SecureField("NVIDIA API Key", text: $apiKey)
@@ -1375,51 +1182,7 @@ struct ContentView: View {
                 .disabled(!canSend)
             }
 
-            // Benchmark controls
-            HStack(spacing: 8) {
-                TextField("Benchmark prompt…", text: $benchmarkPrompt, axis: .vertical)
-                    .lineLimit(1...2)
-                    .padding(8)
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(.secondary))
-                Button {
-                    Task {
-                        // Requested set: QWEN2.5-VL-72B, QWEN2.5-VL-32B, GEMMA3-27B, GEMMA3-14B
-                        // Note: Public Gemma 3 variants are 4B/12B/27B; we map 14B -> 12B here.
-                        let candidates = [
-                            "Qwen/Qwen2.5-VL-72B-Instruct:nebius",
-                            "Qwen/Qwen2.5-VL-32B-Instruct:fireworks-ai",
-                            "google/gemma-3-27b-it:nebius",
-                            "google/gemma-3-12b-it:featherless-ai" // mapped from 14B request
-                        ]
-                        isSending = true
-                        defer { isSending = false }
-                        await runVLMComparison(models: candidates, prompt: benchmarkPrompt)
-                    }
-                } label: {
-                    if isSending { ProgressView() } else { Text("Run VLM Benchmark") }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(false)
-                
-                Button {
-                    Task {
-                        // Same candidate set as the single-run button
-                        let candidates = [
-                            "Qwen/Qwen2.5-VL-72B-Instruct:nebius",
-                            "Qwen/Qwen2.5-VL-32B-Instruct:fireworks-ai",
-                            "google/gemma-3-27b-it:nebius",
-                            "google/gemma-3-12b-it:featherless-ai" // mapped from 14B request
-                        ]
-                        isSending = true
-                        defer { isSending = false }
-                        await runVLMTrials(trials: 10, models: candidates, prompt: benchmarkPrompt)
-                    }
-                } label: {
-                    if isSending { ProgressView() } else { Text("Run 10×") }
-                }
-                .buttonStyle(.bordered)
-                .disabled(hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
+         
 
             // Listening badge (shows only while mic is active)
             if stt.isListening {
@@ -1487,7 +1250,6 @@ struct ContentView: View {
             // Ensure playback session is configured for TTS at launch
             speech.configureAudioSession()
             print("NOTE: Requested GEMMA3-14B not found; using GEMMA3-12B via featherless-ai; Qwen-32B via fireworks-ai.")
-            FastVLMEngine.debugLogBundleTree()
         }
     }
 
@@ -1990,98 +1752,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - VLM Benchmarking
-    private struct VLMResult: Codable {
-        let model: String
-        let success: Bool
-        let latency_ms: Int
-        let output_preview: String
-        let output_chars: Int
-        let error: String?
-    }
 
-    private func makeVLMTestMessages(prompt: String, imageData: Data, mime: String) -> [HFMessage] {
-        let dataURL = "data:\(mime);base64," + imageData.base64EncodedString()
-        let sys = HFMessage(role: "system", content: [HFContentPart(type: "text", text: "You are evaluating a vision-language model. Return a concise answer in 2-3 sentences. No markdown.", image_url: nil)])
-        let usr = HFMessage(role: "user", content: [
-            HFContentPart(type: "text", text: prompt, image_url: nil),
-            HFContentPart(type: "image_url", text: nil, image_url: HFImageURL(url: dataURL))
-        ])
-        return [sys, usr]
-    }
-
-    @MainActor
-    private func runVLMComparison(models: [String], prompt: String) async {
-        guard !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            print("VLM_BENCH_ERROR {\"reason\":\"Missing HF token\"}")
-            return
-        }
-        guard let rawImage = selectedImageData ?? {
-            print("VLM_BENCH_ERROR {\"reason\":\"No image selected. Use the Screenshot picker first.\"}")
-            return nil
-        }() else { return }
-
-        // Normalize payload to a consistent size/quality for fairness
-        let (payload, mime) = optimizedPayload(for: rawImage)
-        print("VLM_BENCH_START {\"payload_bytes\":\(payload.count), \"mime\":\"\(mime)\", \"prompt_chars\":\(prompt.count)}")
-
-        var results: [VLMResult] = []
-        for modelID in models {
-            let started = Date()
-            do {
-                let msgs = makeVLMTestMessages(prompt: prompt, imageData: payload, mime: mime)
-                let text = try await vlmChat(messages: msgs,
-                                             model: modelID,
-                                             maxTokens: 384,
-                                             temperature: 0.2,
-                                             responseFormat: nil)
-                let took = Int(Date().timeIntervalSince(started) * 1000)
-                let preview = String(text.prefix(220)).replacingOccurrences(of: "\n", with: " ")
-                let entry = VLMResult(model: modelID,
-                                      success: true,
-                                      latency_ms: took,
-                                      output_preview: preview,
-                                      output_chars: text.count,
-                                      error: nil)
-                results.append(entry)
-                if let data = try? JSONEncoder().encode(entry), let line = String(data: data, encoding: .utf8) {
-                    print("VLM_MODEL_RESULT \(line)")
-                } else {
-                    print("VLM_MODEL_RESULT {\"model\":\"\(modelID)\",\"note\":\"Encoding failed\"}")
-                }
-            } catch {
-                let took = Int(Date().timeIntervalSince(started) * 1000)
-                let entry = VLMResult(model: modelID,
-                                      success: false,
-                                      latency_ms: took,
-                                      output_preview: "",
-                                      output_chars: 0,
-                                      error: error.localizedDescription)
-                results.append(entry)
-                if let data = try? JSONEncoder().encode(entry), let line = String(data: data, encoding: .utf8) {
-                    print("VLM_MODEL_RESULT \(line)")
-                } else {
-                    print("VLM_MODEL_RESULT {\"model\":\"\(modelID)\",\"error\":\"\(error.localizedDescription)\"}")
-                }
-            }
-        }
-        // Compact summary array to copy/paste back for analysis
-        if let blob = try? JSONEncoder().encode(results), let text = String(data: blob, encoding: .utf8) {
-            print("VLM_BENCH_SUMMARY \(text)")
-        }
-    }
-    
-    /// Run N benchmark trials back-to-back, printing headers so each run is easy to grep in Xcode.
-    @MainActor
-    private func runVLMTrials(trials: Int, models: [String], prompt: String) async {
-        print("VLM_TRIALS_BEGIN {\"trials\":\(trials)}")
-        for i in 1...trials {
-            print("VLM_TRIAL_START {\"run\":\(i)}")
-            await runVLMComparison(models: models, prompt: prompt)
-            print("VLM_TRIAL_END {\"run\":\(i)}")
-        }
-        print("VLM_TRIALS_END {\"trials\":\(trials)}")
-    }
 
     // MARK: - Actions
     @MainActor
@@ -2105,15 +1776,13 @@ struct ContentView: View {
             print("Vision upload bytes:", payloadData.count)
 
             // Badge + sending state
-            activeEngine = useFastVLM ? "FastVLM (on-device)" : "QWEN Vision Agent"
+            activeEngine = "QWEN Vision Agent"
             isSending = true
             defer { isSending = false }
 
-            if useFastVLM {
-                await runFastVLM(imageData: payloadData, mime: payloadMime, userText: promptToUse)
-            } else {
-                await runQwenAgent(imageData: payloadData, mime: payloadMime, userText: promptToUse)
-            }
+          
+            await runQwenAgent(imageData: payloadData, mime: payloadMime, userText: promptToUse)
+            
             // Auto-clear screenshot selection after a vision turn
             await MainActor.run {
                 selectedImageData = nil
@@ -2131,18 +1800,16 @@ struct ContentView: View {
 
             // Fetch & normalize the image
             isSending = true
-            activeEngine = useFastVLM ? "FastVLM (on-device)" : "QWEN Vision Agent"
+            activeEngine = "QWEN Vision Agent"
             defer { isSending = false }
             do {
                 let (raw, _) = try await fetchImageFromURL(imageURLText)
                 let (payloadData, payloadMime) = optimizedPayload(for: raw)
                 print("Vision payload bytes (from URL):", payloadData.count)
-                activeEngine = useFastVLM ? "FastVLM (on-device)" : "QWEN Vision Agent"
-                if useFastVLM {
-                    await runFastVLM(imageData: payloadData, mime: payloadMime, userText: promptToUse)
-                } else {
-                    await runQwenAgent(imageData: payloadData, mime: payloadMime, userText: promptToUse)
-                }
+                activeEngine = "QWEN Vision Agent"
+                
+                await runQwenAgent(imageData: payloadData, mime: payloadMime, userText: promptToUse)
+                
                 await MainActor.run {
                     // Clear URL after a vision turn
                     imageURLText = ""
