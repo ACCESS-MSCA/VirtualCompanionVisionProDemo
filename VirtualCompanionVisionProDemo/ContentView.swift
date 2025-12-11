@@ -304,6 +304,7 @@ final class SpeechToTextManager: NSObject, ObservableObject {
         // Create the streaming request (report partial results for live UI)
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
+        req.requiresOnDeviceRecognition = true   // <-- important on visionOS
         self.request = req
 
         // Install a tap on the input node
