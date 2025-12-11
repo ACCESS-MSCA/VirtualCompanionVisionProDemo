@@ -252,15 +252,9 @@ final class SpeechToTextManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        // Prefer British English for recognition; fall back to device TTS language if not supported
-        let preferred = Locale(identifier: "en-GB")
-        let srLocale: Locale
-        if SFSpeechRecognizer.supportedLocales().contains(preferred) {
-            srLocale = preferred
-        } else {
-            srLocale = Locale(identifier: AVSpeechSynthesisVoice.currentLanguageCode())
-        }
-        let rec = SFSpeechRecognizer(locale: srLocale)
+        // Use the system default locale so we match whatever on-device assets are installed.
+        // This avoids failing when a specific locale (for example en-GB) does not have local speech models.
+        let rec = SFSpeechRecognizer()
         rec?.delegate = self
         self.recognizer = rec
     }
@@ -304,7 +298,10 @@ final class SpeechToTextManager: NSObject, ObservableObject {
         // Create the streaming request (report partial results for live UI)
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = true   // <-- important on visionOS
+#if os(visionOS) && !targetEnvironment(simulator)
+        // On visionOS hardware, Apple requires on-device models; request on-device recognition explicitly.
+        req.requiresOnDeviceRecognition = true
+#endif
         self.request = req
 
         // Install a tap on the input node
@@ -341,10 +338,17 @@ final class SpeechToTextManager: NSObject, ObservableObject {
                 }
             }
             if let e = error {
-                let msg = e.localizedDescription.lowercased()
+                let lower = e.localizedDescription.lowercased()
                 // Ignore expected cancellations when we stop listening ourselves
-                if msg.contains("canceled") || msg.contains("cancelled") {
+                if lower.contains("canceled") || lower.contains("cancelled") {
                     print("STT: Recognition canceled (expected on stop)")
+                } else if lower.contains("failed to access assets") {
+                    print("STT: On-device speech assets not available on this device/simulator.")
+#if targetEnvironment(simulator)
+                    self.onError?("Speech recognition assets are not available in the simulator. Please test on a real device.")
+#else
+                    self.onError?("Speech recognition assets are not available for this language. Check on-device speech settings.")
+#endif
                 } else {
                     print("STT: Recognition error:", e.localizedDescription)
                     self.onError?("Recognition error: \(e.localizedDescription)")
@@ -1076,20 +1080,6 @@ struct ContentView: View {
             
 
             
-            // API key input (temporary; we’ll store in Keychain next)
-            SecureField("NVIDIA API Key", text: $apiKey)
-                .textContentType(.password)
-                .padding()
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary))
-            SecureField("Hugging Face Token (for Qwen2.5‑VL)", text: $hfToken)
-                .textContentType(.password)
-                .padding()
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary))
-            TextField("HF Model (e.g., Qwen/Qwen2.5-VL-72B-Instruct:nebius)", text: $hfModel)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-                .padding()
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(.secondary))
 
             // Conversation view (auto-scroll; hide system messages)
             ScrollViewReader { proxy in
