@@ -790,8 +790,8 @@ struct ContentView: View {
         }
     }
     
-    @State private var apiKey: String = "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"          // Paste your key for now (we’ll move to Keychain next step)
-    @State private var tavilyKey: String = "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"
+    @State private var apiKey: String = "INSERT_YOUR_NVIDIA_API_KEY_HERE"          // Paste your key for now (we’ll move to Keychain next step)
+    @State private var tavilyKey: String = "INSERT_YOUR_TAVILY_KEY_HERE"
     @State private var userInput: String = ""
     @State private var messages: [ChatMessage] = [
         .init(role: "system", content:
@@ -831,10 +831,10 @@ struct ContentView: View {
     @FocusState private var urlFocused: Bool
 
     // Hugging Face VLM (Qwen2.5-VL) token and screenshot selection
-    @State private var hfToken: String = "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"
+    @State private var hfToken: String = "INSERT_YOUR_HF_TOKEN_HERE"
     // Provider-qualified HF model for Qwen VL (e.g., ":nebius" suffix)
     @State private var hfModel: String = "Qwen/Qwen2.5-VL-72B-Instruct:nebius"
-    private let modelScopeToken: String = "ms-ad35a3c3-03db-4ad2-a9ab-cdae539799b4"
+    private let modelScopeToken: String = "INSERT_MODELSCOPE_API_KEY_OR_LEAVE_EMPTY"
     @State private var selectedItem: PhotosPickerItem? = nil
     @State private var selectedImageData: Data? = nil
     @State private var imageURLText: String = ""
