@@ -52,6 +52,55 @@ struct ChatResponse: Codable {
     let choices: [ChatChoice]
 }
 
+// MARK: - Network Metrics
+struct AIRequestMetric {
+    let provider: String
+    let route: String
+    let ttftMs: Int
+    let totalMs: Int
+    let bytes: Int
+    let statusCode: Int?
+
+    var debugLine: String {
+        "[AI_METRIC] provider=\(provider) route=\(route) ttft_ms=\(ttftMs) total_ms=\(totalMs) bytes=\(bytes) status=\(statusCode ?? -1)"
+    }
+
+    var unityJSON: String {
+        let statusValue = statusCode.map(String.init) ?? "null"
+        return "{\"provider\":\"\(provider)\",\"route\":\"\(route)\",\"ttft_ms\":\(ttftMs),\"total_ms\":\(totalMs),\"bytes\":\(bytes),\"status_code\":\(statusValue)}"
+    }
+}
+
+final class AIRequestMetricsCenter {
+    static let shared = AIRequestMetricsCenter()
+    var onMetric: ((AIRequestMetric) -> Void)?
+
+    private init() {}
+
+    func emit(_ metric: AIRequestMetric) {
+        print(metric.debugLine)
+        onMetric?(metric)
+    }
+}
+
+@discardableResult
+fileprivate func timedData(for req: URLRequest,
+                           provider: String,
+                           route: String) async throws -> (Data, URLResponse, AIRequestMetric) {
+    let started = Date()
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+    let status = (resp as? HTTPURLResponse)?.statusCode
+    let metric = AIRequestMetric(provider: provider,
+                                 route: route,
+                                 ttftMs: elapsedMs,
+                                 totalMs: elapsedMs,
+                                 bytes: data.count,
+                                 statusCode: status)
+    AIRequestMetricsCenter.shared.emit(metric)
+    return (data, resp, metric)
+}
+
 // MARK: - Client
 final class NvidiaChatClient {
     private let endpoint = URL(string: "https://integrate.api.nvidia.com/v1/chat/completions")!
@@ -78,7 +127,7 @@ final class NvidiaChatClient {
                                response_format: responseFormat)
         req.httpBody = try JSONEncoder().encode(body)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp, _) = try await timedData(for: req, provider: "NVIDIA", route: "/v1/chat/completions")
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? "Unknown error"
             throw NSError(domain: "NVIDIA", code: (resp as? HTTPURLResponse)?.statusCode ?? -1, userInfo: [NSLocalizedDescriptionKey: text])
@@ -157,7 +206,7 @@ final class HFVLMClient {
         req.setValue("Bearer \(hfToken)", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONEncoder().encode(body)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp, _) = try await timedData(for: req, provider: "HF", route: "/v1/chat/completions:image")
         if let http = resp as? HTTPURLResponse, http.statusCode == 413 {
             throw NSError(domain: "HF", code: 413,
                           userInfo: [NSLocalizedDescriptionKey: "Image too large for server. I reduced size automatically—please retry. If it persists, try a smaller screenshot."])
@@ -192,7 +241,7 @@ final class HFVLMClient {
         req.setValue("Bearer \(hfToken)", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONEncoder().encode(body)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp, _) = try await timedData(for: req, provider: "HF", route: "/v1/chat/completions")
         if let http = resp as? HTTPURLResponse, http.statusCode == 413 {
             throw NSError(domain: "HF", code: 413,
                           userInfo: [NSLocalizedDescriptionKey: "Image too large for server. I reduced size automatically—please retry. If it persists, try a smaller screenshot."])
@@ -211,11 +260,15 @@ final class HFVLMClient {
 // MARK: - Speech
 final class SpeechManager: ObservableObject {
     let synth = AVSpeechSynthesizer()
+    
     func configureAudioSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, options: [.duckOthers])
+            try? session.setActive(false, options: .notifyOthersOnDeactivation) // <- importante
+            try session.setCategory(.playAndRecord, mode: .measurement, options: [])
             try session.setActive(true)
+           // try session.setCategory(.playback, options: [.duckOthers])
+           // try session.setActive(true)
         } catch {
             print("AudioSession error:", error.localizedDescription)
         }
@@ -307,6 +360,8 @@ final class SpeechToTextManager: NSObject, ObservableObject {
         // Install a tap on the input node
         let input = audioEngine.inputNode
         let format = input.outputFormat(forBus: 0)
+        audioEngine.stop()
+        audioEngine.reset()
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.request?.append(buffer)
@@ -360,6 +415,62 @@ final class SpeechToTextManager: NSObject, ObservableObject {
         // Kick off silence timer
         resetSilenceTimer(seconds)
     }
+    
+    func transcribeFile(atPath path: String) {
+        // Limpia estado anterior
+        task?.cancel()
+        task = nil
+        request = nil
+        partialText = ""
+
+        guard let recognizer else {
+            onError?("Speech recognizer not available.")
+            return
+        }
+        guard recognizer.isAvailable else {
+            onError?("Speech recognizer is currently unavailable.")
+            return
+        }
+
+        let url = URL(fileURLWithPath: path)
+        if !FileManager.default.fileExists(atPath: url.path) {
+            onError?("Audio file not found at path: \(url.path)")
+            return
+        }
+
+        let req = SFSpeechURLRecognitionRequest(url: url)
+        req.shouldReportPartialResults = true
+
+        DispatchQueue.main.async { self.isListening = true }
+        print("STT: Transcribing file:", url.lastPathComponent)
+
+        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            guard let self else { return }
+
+            if let res = result {
+                let text = res.bestTranscription.formattedString
+                DispatchQueue.main.async {
+                    self.partialText = text
+                    self.onPartial?(text)
+                }
+                if res.isFinal {
+                    print("STT: Final transcript (file):", text)
+                    self.finish(final: text)
+                }
+            }
+
+            if let e = error {
+                let lower = e.localizedDescription.lowercased()
+                if lower.contains("canceled") || lower.contains("cancelled") {
+                    print("STT: canceled (expected)")
+                } else {
+                    print("STT file error:", e.localizedDescription)
+                    self.onError?("Recognition error: \(e.localizedDescription)")
+                }
+                self.finish(final: nil)
+            }
+        }
+    }
 
     /// Stop listening. If `finalize` is true, emit the last partial as final.
     func stopListening(finalize: Bool = true) {
@@ -403,6 +514,11 @@ extension SpeechToTextManager: SFSpeechRecognizerDelegate {}
 // MARK: - Mood steering (manual selection)
 enum MoodTag: String, CaseIterable, Identifiable {
     case happy, calm, sad, crying, angry, anxious
+    var id: String { rawValue }
+}
+
+enum VoiceGender: String, CaseIterable, Identifiable {
+    case male, female, neutral
     var id: String { rawValue }
 }
 
@@ -514,11 +630,10 @@ fileprivate func shouldFriendlyRewrite(_ text: String) -> Bool {
 
 // MARK: - Unity Bridge (C-callable wrappers using @_cdecl)
 // C# delegate type: void SwiftCallback(const char* message)
-typealias UnityCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
+public typealias UnityCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
+public typealias UnityBytesCallback = @convention(c) (UnsafePointer<UInt8>?, Int32) -> Void
 
-
-
-final class MovioUnityBridge: NSObject {
+final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     static let shared = MovioUnityBridge()
 
     // Basic components reused from this file
@@ -526,7 +641,7 @@ final class MovioUnityBridge: NSObject {
     let stt    = SpeechToTextManager()
     let nvidia = NvidiaChatClient()
     let hf     = HFVLMClient()
-
+    
     // Config
     var nvidiaKey: String = ""
     var tavilyKey: String = ""   // reserved; not used in this minimal bridge
@@ -536,9 +651,15 @@ final class MovioUnityBridge: NSObject {
     // Mood used to decorate prompts and TTS parameters
     var mood: MoodTag = .calm
 
+    // Voice selection used by Unity-facing TTS controls
+    var voiceGender: VoiceGender = .neutral
+    var voicePitch: Float = 1.0
+    var voiceLanguage: String = "en-GB"
+    var voiceIdentifier: String? = nil
+
     // Optional callback back into Unity
     private var unityCallback: UnityCallback?
-
+    private var unityBytesCallback: UnityBytesCallback?
     override init() {
         super.init()
         // STT -> Unity forwarding (dispatch to main to be safe with Unity APIs)
@@ -547,17 +668,82 @@ final class MovioUnityBridge: NSObject {
         stt.onError   = { [weak self] msg  in self?.sendToUnity("error:" + msg) }
         // Ensure playback session is ready for TTS
         speech.configureAudioSession()
+        speech.synth.delegate = self
+        AIRequestMetricsCenter.shared.onMetric = { [weak self] metric in
+            self?.sendMetricToUnity(metric)
+        }
     }
 
     // MARK: - Unity callback wiring
     func registerCallback(_ cb: UnityCallback?) { self.unityCallback = cb }
-    private func sendToUnity(_ message: String) {
-        guard let cb = unityCallback else { return }
-        // Ensure callbacks land on the main thread for Unity safety
+    fileprivate func sendToUnity(_ message: String) {
+        guard let cb = unityBytesCallback else { return }
+
+        let utf8 = Array(message.utf8)
+        let len = utf8.count
+
+        let ptr = UnsafeMutablePointer<UInt8>.allocate(capacity: len)
+        ptr.initialize(from: utf8, count: len)
+
         DispatchQueue.main.async {
-            message.withCString { cStr in cb(cStr) }
+            cb(ptr, Int32(len))
+            ptr.deallocate()
         }
     }
+
+
+    private func sendMetricToUnity(_ metric: AIRequestMetric) {
+        sendToUnity("metric:" + metric.unityJSON)
+        sendToUnity("metric_ttft:" + metric.provider + ":" + String(metric.ttftMs))
+        sendToUnity("metric_total:" + metric.provider + ":" + String(metric.totalMs))
+    }
+    func sttFromFile(path: String) {
+        stt.ensureAuthorization { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.sendToUnity("error:Speech permission is required.")
+                return
+            }
+            self.stt.onPartial = { [weak self] t in self?.sendToUnity("stt_partial:" + t) }
+            self.stt.onFinal   = { [weak self] t in self?.sendToUnity("stt_final:" + t) }
+            self.stt.onError   = { [weak self] e in self?.sendToUnity("error:" + e) }
+
+            self.stt.transcribeFile(atPath: path)
+        }
+    }
+
+    private var ttsPending = 0
+        private var ttsBatchId = UUID()
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                           didStart utterance: AVSpeechUtterance) {
+        //sendToUnity("tts_started")
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                           didFinish utterance: AVSpeechUtterance) {
+        // Solo avisamos cuando ya terminó TODO
+        ttsPending = max(0, ttsPending - 1)
+                if ttsPending == 0 {
+                    sendToUnity("tts_finished")
+                }
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
+                           didCancel utterance: AVSpeechUtterance) {
+        ttsPending = 0
+        sendToUnity("tts_cancelled")
+        sendToUnity("tts_finished")
+    }
+    //private func sendToUnity(_ message: String) {
+       // guard let cb = unityCallback else { return }
+        // Ensure callbacks land on the main thread for Unity safety
+        
+        //DispatchQueue.main.async {
+        //    message.withCString { cStr in cb(cStr) }
+        //}
+    //}
+
+    func registerBytesCallback(_ cb: UnityBytesCallback?) { self.unityBytesCallback = cb }
 
     // MARK: - Public operations
     func setConfig(nvidiaKey: String, tavilyKey: String, hfToken: String, hfModel: String?) {
@@ -568,6 +754,117 @@ final class MovioUnityBridge: NSObject {
     }
 
     func setMood(_ m: MoodTag) { self.mood = m }
+
+    func setVoiceGender(_ gender: VoiceGender) {
+        self.voiceGender = gender
+    }
+
+    func setVoicePitch(_ pitch: Float) {
+        self.voicePitch = max(0.5, min(pitch, 2.0))
+    }
+
+    func setVoiceLanguage(_ language: String) {
+        let trimmed = language.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            self.voiceLanguage = trimmed
+        }
+    }
+
+    func setVoiceIdentifier(_ identifier: String?) {
+        let trimmed = identifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.voiceIdentifier = trimmed.isEmpty ? nil : trimmed
+    }
+
+    func availableVoicesSummary() -> String {
+        AVSpeechSynthesisVoice.speechVoices()
+            .map { voice in
+                let name = voice.name
+                let lang = voice.language
+                let id = voice.identifier
+                let quality: String
+                switch voice.quality {
+                case .default: quality = "default"
+                case .enhanced: quality = "enhanced"
+                @unknown default: quality = "unknown"
+                }
+                return "\(name) | \(lang) | \(id) | \(quality)"
+            }
+            .joined(separator: "\n")
+    }
+
+    private func resolveVoice() -> AVSpeechSynthesisVoice? {
+        if let identifier = voiceIdentifier,
+           let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
+            return exactVoice
+        }
+
+        let preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackLanguage = AVSpeechSynthesisVoice.currentLanguageCode()
+        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+
+        let languageMatched = allVoices.filter {
+            $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
+        }
+        let regionalMatched = languageMatched.isEmpty
+            ? allVoices.filter { $0.language.lowercased().hasPrefix(preferredLanguage.lowercased().prefix(2)) }
+            : languageMatched
+        let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
+
+        func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
+            let name = voice.name.lowercased()
+            switch voiceGender {
+            case .male:
+                if name.contains("male") { return 3 }
+                if name.contains("man") { return 2 }
+                return 0
+            case .female:
+                if name.contains("female") { return 3 }
+                if name.contains("woman") { return 2 }
+                return 0
+            case .neutral:
+                return 0
+            }
+        }
+
+        func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
+            switch voice.quality {
+            case .enhanced: return 1
+            default: return 0
+            }
+        }
+
+        if voiceGender != .neutral,
+           let gendered = primaryPool
+            .sorted(by: {
+                let left = genderScore(for: $0)
+                let right = genderScore(for: $1)
+                if left != right { return left > right }
+                let leftQuality = qualityScore(for: $0)
+                let rightQuality = qualityScore(for: $1)
+                if leftQuality != rightQuality { return leftQuality > rightQuality }
+                return $0.name < $1.name
+            })
+            .first(where: { genderScore(for: $0) > 0 }) {
+            return gendered
+        }
+
+        if let preferred = primaryPool.sorted(by: {
+            let leftQuality = qualityScore(for: $0)
+            let rightQuality = qualityScore(for: $1)
+            if leftQuality != rightQuality { return leftQuality > rightQuality }
+            return $0.name < $1.name
+        }).first {
+            return preferred
+        }
+
+        if let fallback = AVSpeechSynthesisVoice(language: preferredLanguage) {
+            return fallback
+        }
+        if let current = AVSpeechSynthesisVoice(language: fallbackLanguage) {
+            return current
+        }
+        return AVSpeechSynthesisVoice(language: "en-GB") ?? AVSpeechSynthesisVoice(language: "en-US")
+    }
 
     // STT control
     func startSTT() {
@@ -593,17 +890,38 @@ final class MovioUnityBridge: NSObject {
     func speak(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let voice = AVSpeechSynthesisVoice(language: "en-GB")
-                 ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
-        let (rate, pitch) = ttsParams(for: mood)
+        // Nueva tanda
+        ttsBatchId = UUID()
+        let batch = ttsBatchId
+        
+        // Si estabas hablando, cancela y avisa (opcional pero recomendado)
+        if speech.synth.isSpeaking || speech.synth.isPaused {
+            speech.synth.stopSpeaking(at: .immediate)
+            // no envíes finished aquí; llegará didCancel / didFinish
+        }
+        
+        let sentences = mcSplitIntoSentences(trimmed)
+        ttsPending = sentences.count
+        sendToUnity("tts_started")
+        
+        let voice = resolveVoice()
+        let (rate, moodPitch) = ttsParams(for: mood)
+        let finalPitch = max(0.5, min(voicePitch * moodPitch, 2.0))
         speech.synth.stopSpeaking(at: .immediate)
         for (i, sentence) in mcSplitIntoSentences(trimmed).enumerated() {
             let u = AVSpeechUtterance(string: sentence)
             u.voice = voice
             u.rate  = rate
-            u.pitchMultiplier = pitch
+            u.pitchMultiplier = finalPitch
             u.postUtteranceDelay = (i == 0) ? 0.0 : 0.12
             speech.synth.speak(u)
+        }
+        // Si por algún motivo la cola quedó vacía (raro), fuerza final
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            if self.ttsBatchId == batch, self.ttsPending == 0 {
+                self.sendToUnity("tts_finished")
+            }
         }
     }
     func stopSpeak() { speech.synth.stopSpeaking(at: .immediate) }
@@ -627,7 +945,6 @@ final class MovioUnityBridge: NSObject {
                 msgs.append(.init(role: "assistant", content: "Go La La Land if you want dreamy jazz and bittersweet smiles. If you want pure sparkle, The Greatest Showman is popcorn joy. Tell me your vibe and I’ll dial it in."))
                 // Actual turn
                 msgs.append(.init(role: "user", content: user))
-
                 let res = try await nvidia.send(messages: msgs,
                                                 apiKey: nvidiaKey,
                                                 model: "openai/gpt-oss-20b",
@@ -636,13 +953,14 @@ final class MovioUnityBridge: NSObject {
                                                 topP: 0.95,
                                                 responseFormat: nil)
                 var answer = (res.choices.first?.message?.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                print("REspuesta de nvidia: \(answer)")
                 if !answer.isEmpty, shouldFriendlyRewrite(answer) {
                     if let rewritten = try? await friendlyRewrite(answer, mood: self.mood), !rewritten.isEmpty {
                         answer = rewritten
                     }
                 }
                 if answer.isEmpty { self.sendToUnity("answer:gpt-oss:\nSorry — I couldn’t generate an answer.") }
-                else { self.sendToUnity("answer:gpt-oss:\n" + answer) }
+                else { self.sendToUnity(/*"answer:gpt-oss:" + */answer) }
             } catch {
                 self.sendToUnity("error:" + error.localizedDescription)
             }
@@ -715,10 +1033,10 @@ final class MovioUnityBridge: NSObject {
 
 // MARK: - C-callable exports for Unity (IL2CPP)
 
-//@_cdecl("registerUnityCallback")
-//public func registerUnityCallback(_ cb: UnityCallback?) {
- //   MovioUnityBridge.shared.registerCallback(cb)
-//}
+@_cdecl("registerUnityCallback")
+public func registerUnityCallback(_ cb: UnityCallback?) {
+    MovioUnityBridge.shared.registerCallback(cb)
+}
 
 @_cdecl("movioSetConfig")
 public func movioSetConfig(_ nvidiaKey: UnsafePointer<CChar>?,
@@ -732,11 +1050,42 @@ public func movioSetConfig(_ nvidiaKey: UnsafePointer<CChar>?,
     MovioUnityBridge.shared.setConfig(nvidiaKey: n, tavilyKey: t, hfToken: h, hfModel: m)
 }
 
+
 @_cdecl("movioSetMood")
 public func movioSetMood(_ moodName: UnsafePointer<CChar>?) {
     let name = (moodName.flatMap { String(cString: $0) } ?? "calm").lowercased()
     let map: [String: MoodTag] = ["happy": .happy, "calm": .calm, "sad": .sad, "crying": .crying, "angry": .angry, "anxious": .anxious]
     MovioUnityBridge.shared.setMood(map[name] ?? .calm)
+}
+
+@_cdecl("movioSetVoiceGender")
+public func movioSetVoiceGender(_ genderName: UnsafePointer<CChar>?) {
+    let name = (genderName.flatMap { String(cString: $0) } ?? "neutral").lowercased()
+    let map: [String: VoiceGender] = ["male": .male, "female": .female, "neutral": .neutral]
+    MovioUnityBridge.shared.setVoiceGender(map[name] ?? .neutral)
+}
+
+@_cdecl("movioSetVoicePitch")
+public func movioSetVoicePitch(_ pitch: Float) {
+    MovioUnityBridge.shared.setVoicePitch(pitch)
+}
+
+@_cdecl("movioSetVoiceLanguage")
+public func movioSetVoiceLanguage(_ language: UnsafePointer<CChar>?) {
+    let value = language.flatMap { String(cString: $0) } ?? ""
+    MovioUnityBridge.shared.setVoiceLanguage(value)
+}
+
+@_cdecl("movioSetVoiceIdentifier")
+public func movioSetVoiceIdentifier(_ identifier: UnsafePointer<CChar>?) {
+    let value = identifier.flatMap { String(cString: $0) }
+    MovioUnityBridge.shared.setVoiceIdentifier(value)
+}
+
+@_cdecl("movioListVoices")
+public func movioListVoices() {
+    let summary = MovioUnityBridge.shared.availableVoicesSummary()
+    MovioUnityBridge.shared.sendToUnity("voices:" + summary)
 }
 
 @_cdecl("movioStartSTT")
@@ -767,6 +1116,18 @@ public func movioAskVisionBase64(_ base64Image: UnsafePointer<CChar>?, _ prompt:
     MovioUnityBridge.shared.askVision(base64Image: b64, prompt: p)
 }
 
+@_cdecl("registerUnityBytesCallback")
+public func registerUnityBytesCallback(_ cb: UnityBytesCallback?) {
+    MovioUnityBridge.shared.registerBytesCallback(cb)
+}
+
+@_cdecl("movioSTTFromFile")
+public func movioSTTFromFile(_ path: UnsafePointer<CChar>?) {
+    let p = path.flatMap { String(cString: $0) } ?? ""
+    MovioUnityBridge.shared.sttFromFile(path: p)
+}
+
+
 // MARK: - UI
 struct ContentView: View {
     private var hasImageInput: Bool {
@@ -790,8 +1151,8 @@ struct ContentView: View {
         }
     }
     
-    @State private var apiKey: String = "INSERT_YOUR_NVIDIA_API_KEY_HERE"          // Paste your key for now (we’ll move to Keychain next step)
-    @State private var tavilyKey: String = "INSERT_YOUR_TAVILY_KEY_HERE"
+    @State private var apiKey: String = "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"          // Paste your key for now (we’ll move to Keychain next step)
+    @State private var tavilyKey: String = "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"
     @State private var userInput: String = ""
     @State private var messages: [ChatMessage] = [
         .init(role: "system", content:
@@ -827,14 +1188,15 @@ struct ContentView: View {
     @StateObject private var stt = SpeechToTextManager()   // on-device STT
     // Manual mood selection for research/tests
     @State private var selectedMood: MoodTag = .calm
+    @State private var selectedVoiceGender: VoiceGender = .neutral
     @FocusState private var promptFocused: Bool
     @FocusState private var urlFocused: Bool
 
     // Hugging Face VLM (Qwen2.5-VL) token and screenshot selection
-    @State private var hfToken: String = "INSERT_YOUR_HF_TOKEN_HERE"
+    @State private var hfToken: String = "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"
     // Provider-qualified HF model for Qwen VL (e.g., ":nebius" suffix)
     @State private var hfModel: String = "Qwen/Qwen2.5-VL-72B-Instruct:nebius"
-    private let modelScopeToken: String = "INSERT_MODELSCOPE_API_KEY_OR_LEAVE_EMPTY"
+    private let modelScopeToken: String = "ms-ad35a3c3-03db-4ad2-a9ab-cdae539799b4"
     @State private var selectedItem: PhotosPickerItem? = nil
     @State private var selectedImageData: Data? = nil
     @State private var imageURLText: String = ""
@@ -932,7 +1294,7 @@ struct ContentView: View {
             "max_tokens": maxTokens
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp, _) = try await timedData(for: req, provider: "ModelScope", route: "/v1/chat/completions")
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw NSError(domain: "ModelScope",
                           code: (resp as? HTTPURLResponse)?.statusCode ?? -1,
@@ -1021,7 +1383,7 @@ struct ContentView: View {
             "include_answer": true
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp, _) = try await timedData(for: req, provider: "Tavily", route: "/search")
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             return String(data: data, encoding: .utf8) ?? ""
         }
@@ -1063,7 +1425,8 @@ struct ContentView: View {
             }
             
             // Mood selector (lightweight UI for research)
-            HStack(spacing: 8) {
+            // Mood + voice selector (lightweight UI for research)
+            HStack(spacing: 12) {
                 Text("Mood:")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1075,6 +1438,22 @@ struct ContentView: View {
                     Label(selectedMood.rawValue.capitalized, systemImage: "face.smiling")
                         .font(.caption)
                 }
+
+                Text("Voice:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Menu {
+                    ForEach(VoiceGender.allCases) { g in
+                        Button(g.rawValue.capitalized) {
+                            selectedVoiceGender = g
+                            MovioUnityBridge.shared.setVoiceGender(g)
+                        }
+                    }
+                } label: {
+                    Label(selectedVoiceGender.rawValue.capitalized, systemImage: "speaker.wave.2")
+                        .font(.caption)
+                }
+
                 Spacer()
             }
             
@@ -1238,10 +1617,14 @@ struct ContentView: View {
         }
         .padding(24)
         .onAppear {
-            // Ensure playback session is configured for TTS at launch
-            speech.configureAudioSession()
-            print("NOTE: Requested GEMMA3-14B not found; using GEMMA3-12B via featherless-ai; Qwen-32B via fireworks-ai.")
-        }
+                // Ensure playback session is configured for TTS at launch
+                speech.configureAudioSession()
+                MovioUnityBridge.shared.setVoiceGender(selectedVoiceGender)
+                print("NOTE: Requested GEMMA3-14B not found; using GEMMA3-12B via featherless-ai; Qwen-32B via fireworks-ai.")
+            }
+            .onChange(of: selectedVoiceGender) { _, newValue in
+                MovioUnityBridge.shared.setVoiceGender(newValue)
+            }
     }
 
     // Fetch a remote image and return (rawData, mime). We accept only https and image/* responses.
@@ -1256,10 +1639,8 @@ struct ContentView: View {
         req.setValue("Mozilla/5.0 (Movio-Swift)", forHTTPHeaderField: "User-Agent")
         req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
 
-        let started = Date()
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        let ms = Int(Date().timeIntervalSince(started) * 1000)
-        print("URL fetch ms:", ms, "bytes:", data.count)
+        let (data, resp, metric) = try await timedData(for: req, provider: "RemoteImage", route: "GET image")
+        print("URL fetch ms:", metric.totalMs, "bytes:", data.count)
 
         let len = resp.expectedContentLength
         if len > 0 && len > (maxDownloadBytes * 2) {
@@ -1299,6 +1680,76 @@ struct ContentView: View {
     private func showAndSpeak(_ text: String) {
         messages.append(.init(role: "assistant", content: text))
         speakAnswer(text)
+    }
+
+    private func resolveContentViewVoice() -> AVSpeechSynthesisVoice? {
+        let preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+
+        if let identifier = MovioUnityBridge.shared.voiceIdentifier,
+        let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
+            return exactVoice
+        }
+
+        let languageMatched = allVoices.filter {
+            $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
+        }
+        let regionalMatched = languageMatched.isEmpty
+            ? allVoices.filter { $0.language.lowercased().hasPrefix(preferredLanguage.lowercased().prefix(2)) }
+            : languageMatched
+        let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
+
+        func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
+            let name = voice.name.lowercased()
+            switch selectedVoiceGender {
+            case .male:
+                if name.contains("male") { return 3 }
+                if name.contains("man") { return 2 }
+                return 0
+            case .female:
+                if name.contains("female") { return 3 }
+                if name.contains("woman") { return 2 }
+                return 0
+            case .neutral:
+                return 0
+            }
+        }
+
+        func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
+            switch voice.quality {
+            case .enhanced: return 1
+            default: return 0
+            }
+        }
+
+        if selectedVoiceGender != .neutral,
+        let gendered = primaryPool
+            .sorted(by: {
+                let left = genderScore(for: $0)
+                let right = genderScore(for: $1)
+                if left != right { return left > right }
+                let leftQuality = qualityScore(for: $0)
+                let rightQuality = qualityScore(for: $1)
+                if leftQuality != rightQuality { return leftQuality > rightQuality }
+                return $0.name < $1.name
+            })
+            .first(where: { genderScore(for: $0) > 0 }) {
+            return gendered
+        }
+
+        if let preferred = primaryPool.sorted(by: {
+            let leftQuality = qualityScore(for: $0)
+            let rightQuality = qualityScore(for: $1)
+            if leftQuality != rightQuality { return leftQuality > rightQuality }
+            return $0.name < $1.name
+        }).first {
+            return preferred
+        }
+
+        return AVSpeechSynthesisVoice(language: preferredLanguage)
+            ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+            ?? AVSpeechSynthesisVoice(language: "en-GB")
+            ?? AVSpeechSynthesisVoice(language: "en-US")
     }
 
     // DRY: compress/resize an attached screenshot to an optimized payload
@@ -1497,8 +1948,7 @@ struct ContentView: View {
         lastSpoken = speakable
 
         // 2) Configure voice: prefer British English; fall back to device's current language
-        let voice = AVSpeechSynthesisVoice(language: "en-GB")
-                 ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+        let voice = resolveContentViewVoice()
         let (rate, pitch) = ttsParams(for: selectedMood)
 
         // 3) Interrupt anything currently speaking
@@ -1510,7 +1960,7 @@ struct ContentView: View {
             let u = AVSpeechUtterance(string: sentence)
             u.voice = voice
             u.rate = rate
-            u.pitchMultiplier = pitch
+            u.pitchMultiplier = max(0.5, min(pitch, 2.0))
             u.postUtteranceDelay = (idx == sentences.count - 1) ? 0.0 : 0.12
             speech.synth.speak(u)
         }
