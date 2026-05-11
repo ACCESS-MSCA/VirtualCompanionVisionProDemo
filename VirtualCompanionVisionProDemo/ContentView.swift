@@ -776,95 +776,105 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     func availableVoicesSummary() -> String {
-        AVSpeechSynthesisVoice.speechVoices()
-            .map { voice in
-                let name = voice.name
-                let lang = voice.language
-                let id = voice.identifier
-                let quality: String
-                switch voice.quality {
-                case .default: quality = "default"
-                case .enhanced: quality = "enhanced"
-                @unknown default: quality = "unknown"
-                }
-                return "\(name) | \(lang) | \(id) | \(quality)"
+    AVSpeechSynthesisVoice.speechVoices()
+        .map { voice in
+            let name = voice.name
+            let lang = voice.language
+            let id = voice.identifier
+
+            let gender: String
+            switch voice.gender {
+            case .male: gender = "male"
+            case .female: gender = "female"
+            case .unspecified: gender = "unspecified"
+            @unknown default: gender = "unknown"
             }
-            .joined(separator: "\n")
-    }
+
+            let quality: String
+            switch voice.quality {
+            case .default: quality = "default"
+            case .enhanced: quality = "enhanced"
+            @unknown default: quality = "unknown"
+            }
+
+            return "\(name) | \(lang) | \(gender) | \(id) | \(quality)"
+        }
+        .joined(separator: "\n")
+}
 
     private func resolveVoice() -> AVSpeechSynthesisVoice? {
-        if let identifier = voiceIdentifier,
-           let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
-            return exactVoice
-        }
+    if let identifier = voiceIdentifier,
+       let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
+        return exactVoice
+    }
 
-        let preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallbackLanguage = AVSpeechSynthesisVoice.currentLanguageCode()
-        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+    let preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallbackLanguage = AVSpeechSynthesisVoice.currentLanguageCode()
+    let allVoices = AVSpeechSynthesisVoice.speechVoices()
 
-        let languageMatched = allVoices.filter {
-            $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
-        }
-        let regionalMatched = languageMatched.isEmpty
-            ? allVoices.filter { $0.language.lowercased().hasPrefix(preferredLanguage.lowercased().prefix(2)) }
-            : languageMatched
-        let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
+    let languageMatched = allVoices.filter {
+        $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
+    }
+    let regionalMatched = languageMatched.isEmpty
+        ? allVoices.filter { $0.language.lowercased().hasPrefix(String(preferredLanguage.lowercased().prefix(2))) }
+        : languageMatched
+    let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
 
-        func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
-            let name = voice.name.lowercased()
-            switch voiceGender {
-            case .male:
-                if name.contains("male") { return 3 }
-                if name.contains("man") { return 2 }
-                return 0
-            case .female:
-                if name.contains("female") { return 3 }
-                if name.contains("woman") { return 2 }
-                return 0
-            case .neutral:
-                return 0
-            }
-        }
-
-        func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
-            switch voice.quality {
-            case .enhanced: return 1
+    func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
+        switch voiceGender {
+        case .male:
+            switch voice.gender {
+            case .male: return 3
+            case .unspecified: return 1
             default: return 0
             }
+        case .female:
+            switch voice.gender {
+            case .female: return 3
+            case .unspecified: return 1
+            default: return 0
+            }
+        case .neutral:
+            switch voice.gender {
+            case .unspecified: return 2
+            default: return 1
+            }
         }
+    }
 
-        if voiceGender != .neutral,
-           let gendered = primaryPool
-            .sorted(by: {
-                let left = genderScore(for: $0)
-                let right = genderScore(for: $1)
-                if left != right { return left > right }
-                let leftQuality = qualityScore(for: $0)
-                let rightQuality = qualityScore(for: $1)
-                if leftQuality != rightQuality { return leftQuality > rightQuality }
-                return $0.name < $1.name
-            })
-            .first(where: { genderScore(for: $0) > 0 }) {
-            return gendered
+    func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
+        switch voice.quality {
+        case .enhanced: return 1
+        default: return 0
         }
+    }
 
-        if let preferred = primaryPool.sorted(by: {
+    if let preferred = primaryPool
+        .sorted(by: {
+            let leftGender = genderScore(for: $0)
+            let rightGender = genderScore(for: $1)
+            if leftGender != rightGender { return leftGender > rightGender }
+
             let leftQuality = qualityScore(for: $0)
             let rightQuality = qualityScore(for: $1)
             if leftQuality != rightQuality { return leftQuality > rightQuality }
-            return $0.name < $1.name
-        }).first {
-            return preferred
-        }
 
-        if let fallback = AVSpeechSynthesisVoice(language: preferredLanguage) {
-            return fallback
-        }
-        if let current = AVSpeechSynthesisVoice(language: fallbackLanguage) {
-            return current
-        }
-        return AVSpeechSynthesisVoice(language: "en-GB") ?? AVSpeechSynthesisVoice(language: "en-US")
+            return $0.name < $1.name
+        })
+        .first(where: { genderScore(for: $0) > 0 }) {
+        return preferred
     }
+
+    if let fallback = AVSpeechSynthesisVoice(language: preferredLanguage) {
+        return fallback
+    }
+    if let current = AVSpeechSynthesisVoice(language: fallbackLanguage) {
+        return current
+    }
+    return AVSpeechSynthesisVoice(language: "en-GB") ?? AVSpeechSynthesisVoice(language: "en-US")
+}
+
+        
 
     // STT control
     func startSTT() {
@@ -1683,74 +1693,72 @@ struct ContentView: View {
     }
 
     private func resolveContentViewVoice() -> AVSpeechSynthesisVoice? {
-        let preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let allVoices = AVSpeechSynthesisVoice.speechVoices()
+    let preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    let allVoices = AVSpeechSynthesisVoice.speechVoices()
 
-        if let identifier = MovioUnityBridge.shared.voiceIdentifier,
-        let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
-            return exactVoice
-        }
+    if let identifier = MovioUnityBridge.shared.voiceIdentifier,
+       let exactVoice = AVSpeechSynthesisVoice(identifier: identifier) {
+        return exactVoice
+    }
 
-        let languageMatched = allVoices.filter {
-            $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
-        }
-        let regionalMatched = languageMatched.isEmpty
-            ? allVoices.filter { $0.language.lowercased().hasPrefix(preferredLanguage.lowercased().prefix(2)) }
-            : languageMatched
-        let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
+    let languageMatched = allVoices.filter {
+        $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
+    }
+    let regionalMatched = languageMatched.isEmpty
+        ? allVoices.filter { $0.language.lowercased().hasPrefix(String(preferredLanguage.lowercased().prefix(2))) }
+        : languageMatched
+    let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
 
-        func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
-            let name = voice.name.lowercased()
-            switch selectedVoiceGender {
-            case .male:
-                if name.contains("male") { return 3 }
-                if name.contains("man") { return 2 }
-                return 0
-            case .female:
-                if name.contains("female") { return 3 }
-                if name.contains("woman") { return 2 }
-                return 0
-            case .neutral:
-                return 0
-            }
-        }
-
-        func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
-            switch voice.quality {
-            case .enhanced: return 1
+    func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
+        switch selectedVoiceGender {
+        case .male:
+            switch voice.gender {
+            case .male: return 3
+            case .unspecified: return 1
             default: return 0
             }
+        case .female:
+            switch voice.gender {
+            case .female: return 3
+            case .unspecified: return 1
+            default: return 0
+            }
+        case .neutral:
+            switch voice.gender {
+            case .unspecified: return 2
+            default: return 1
+            }
         }
+    }
 
-        if selectedVoiceGender != .neutral,
-        let gendered = primaryPool
-            .sorted(by: {
-                let left = genderScore(for: $0)
-                let right = genderScore(for: $1)
-                if left != right { return left > right }
-                let leftQuality = qualityScore(for: $0)
-                let rightQuality = qualityScore(for: $1)
-                if leftQuality != rightQuality { return leftQuality > rightQuality }
-                return $0.name < $1.name
-            })
-            .first(where: { genderScore(for: $0) > 0 }) {
-            return gendered
+    func qualityScore(for voice: AVSpeechSynthesisVoice) -> Int {
+        switch voice.quality {
+        case .enhanced: return 1
+        default: return 0
         }
+    }
 
-        if let preferred = primaryPool.sorted(by: {
+    if let preferred = primaryPool
+        .sorted(by: {
+            let leftGender = genderScore(for: $0)
+            let rightGender = genderScore(for: $1)
+            if leftGender != rightGender { return leftGender > rightGender }
+
             let leftQuality = qualityScore(for: $0)
             let rightQuality = qualityScore(for: $1)
             if leftQuality != rightQuality { return leftQuality > rightQuality }
-            return $0.name < $1.name
-        }).first {
-            return preferred
-        }
 
-        return AVSpeechSynthesisVoice(language: preferredLanguage)
-            ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
-            ?? AVSpeechSynthesisVoice(language: "en-GB")
-            ?? AVSpeechSynthesisVoice(language: "en-US")
+            return $0.name < $1.name
+        })
+        .first(where: { genderScore(for: $0) > 0 }) {
+        return preferred
     }
+
+    return AVSpeechSynthesisVoice(language: preferredLanguage)
+        ?? AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+        ?? AVSpeechSynthesisVoice(language: "en-GB")
+        ?? AVSpeechSynthesisVoice(language: "en-US")
+}
 
     // DRY: compress/resize an attached screenshot to an optimized payload
     private func optimizedPayload(for data: Data) -> (Data, String) {
