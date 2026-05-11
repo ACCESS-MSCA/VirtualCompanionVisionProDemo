@@ -654,7 +654,7 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     // Voice selection used by Unity-facing TTS controls
     var voiceGender: VoiceGender = .neutral
     var voicePitch: Float = 1.0
-    var voiceLanguage: String = "en-GB"
+    var voiceLanguage: String = "en-US"
     var voiceIdentifier: String? = nil
 
     // Optional callback back into Unity
@@ -756,8 +756,9 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     func setMood(_ m: MoodTag) { self.mood = m }
 
     func setVoiceGender(_ gender: VoiceGender) {
-        self.voiceGender = gender
-    }
+    self.voiceGender = gender
+    self.voiceIdentifier = nil
+}
 
     func setVoicePitch(_ pitch: Float) {
         self.voicePitch = max(0.5, min(pitch, 2.0))
@@ -808,16 +809,27 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
         return exactVoice
     }
 
-    let preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    let preferredLanguage: String
+    switch voiceGender {
+    case .male:
+        preferredLanguage = "en-GB"
+    case .female:
+        preferredLanguage = "en-US"
+    case .neutral:
+        preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     let fallbackLanguage = AVSpeechSynthesisVoice.currentLanguageCode()
     let allVoices = AVSpeechSynthesisVoice.speechVoices()
 
     let languageMatched = allVoices.filter {
         $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
     }
+
     let regionalMatched = languageMatched.isEmpty
         ? allVoices.filter { $0.language.lowercased().hasPrefix(String(preferredLanguage.lowercased().prefix(2))) }
         : languageMatched
+
     let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
 
     func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
@@ -871,7 +883,8 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     if let current = AVSpeechSynthesisVoice(language: fallbackLanguage) {
         return current
     }
-    return AVSpeechSynthesisVoice(language: "en-GB") ?? AVSpeechSynthesisVoice(language: "en-US")
+    return AVSpeechSynthesisVoice(language: "en-GB")
+        ?? AVSpeechSynthesisVoice(language: "en-US")
 }
 
         
@@ -1693,7 +1706,16 @@ struct ContentView: View {
     }
 
     private func resolveContentViewVoice() -> AVSpeechSynthesisVoice? {
-    let preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    let preferredLanguage: String
+    switch selectedVoiceGender {
+    case .male:
+        preferredLanguage = "en-GB"
+    case .female:
+        preferredLanguage = "en-US"
+    case .neutral:
+        preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     let allVoices = AVSpeechSynthesisVoice.speechVoices()
 
     if let identifier = MovioUnityBridge.shared.voiceIdentifier,
@@ -1704,9 +1726,11 @@ struct ContentView: View {
     let languageMatched = allVoices.filter {
         $0.language.caseInsensitiveCompare(preferredLanguage) == .orderedSame
     }
+
     let regionalMatched = languageMatched.isEmpty
         ? allVoices.filter { $0.language.lowercased().hasPrefix(String(preferredLanguage.lowercased().prefix(2))) }
         : languageMatched
+
     let primaryPool = regionalMatched.isEmpty ? allVoices : regionalMatched
 
     func genderScore(for voice: AVSpeechSynthesisVoice) -> Int {
