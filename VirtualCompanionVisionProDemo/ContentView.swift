@@ -816,7 +816,7 @@ final class MovioUnityBridge: NSObject, AVSpeechSynthesizerDelegate {
     case .female:
         preferredLanguage = "en-US"
     case .neutral:
-        preferredLanguage = voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        preferredLanguage = "en-GB"
     }
 
     let fallbackLanguage = AVSpeechSynthesisVoice.currentLanguageCode()
@@ -1713,7 +1713,7 @@ struct ContentView: View {
     case .female:
         preferredLanguage = "en-US"
     case .neutral:
-        preferredLanguage = MovioUnityBridge.shared.voiceLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+        preferredLanguage = "en-GB"
     }
 
     let allVoices = AVSpeechSynthesisVoice.speechVoices()
